@@ -1,8 +1,10 @@
 
+import os
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.distributed import init_process_group
 torch.manual_seed(1337)
 
 #!wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -24,19 +26,48 @@ with open(data_file, 'r', encoding='utf-8') as f:
 # n_layer = 3
 # dropout = 0.2
 
+torch.set_float32_matmul_precision('high')
+
+# ---------------------------------------------------------
+# simple lauch: python persona_gpt.py
+# DDP launch :
+# torchrun --standalone  -nproc_per_node=8 persona_gpt.py
+# 
+ddp = int(os.environ.get('RANK',-1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), " for now I think we need cuda for ddp"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    print(device)
+    print('ddp_local_rank', ddp_local_rank)
+    print('ddp_rank', ddp_rank)
+    print('ddp_world_size', ddp_world_size)
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('torch cuda available', torch.cuda.is_available())
+
 batch_size = 64
 block_size = 256 # what is the maximum context length for predictions
 max_iters = 5000
 eval_interval = 500
 learning_rate = 3e-4
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-# device = 'cpu'
-print('torch cuda available', torch.cuda.is_available())
 eval_iters = 200
 n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
+
+# print("I am gpu:", ddp_rank)
+# import sys; sys.exit(0)
 
 torch.manual_seed(1337)
 
@@ -67,18 +98,37 @@ torch.manual_seed(1337)
 def get_batch(split):
   data = train_data if split == 'train' else val_data
   ix = torch.randint(len(data) - block_size, (batch_size,))
-  #print('ix shape:')
-  #print(ix.shape)
   x = torch.stack([data[i:i+block_size] for i in ix])
-  #print('x shape:')
-  #print(x.shape)
   y = torch.stack([data[i+1:i+block_size+1] for i in ix])
   x, y = x.to(device), y.to(device)
-  #print('y shape:')
-  #print(y.shape)
   return x, y
 
-xb, yb = get_batch('train')
+class DataLoader:
+    def __init__(self, data, B, T,  process_rank=0, num_process=1):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_process = num_process
+        self.current_idx = self.B * self.T * self.process_rank
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.data[self.current_idx:self.current_idx + B * T + 1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        self.current_idx += B * T * self.num_process
+        if self.current_idx + B * T * self.num_process + 1> len(self.data):
+            self.current_idx = self.B * self.T * self.process_rank
+        x, y = x.to(device), y.to(device)
+        return x, y
+
+data_loader = DataLoader(train_data, batch_size, block_size )
+
+xb, yb = data_loader.next_batch()
 print('xb shape:')
 print(xb.shape)
 print(xb)
@@ -95,7 +145,7 @@ def estimate_loss():
         losses  = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
 
@@ -119,12 +169,15 @@ class Head(nn.Module):
         B, T, C = x.shape
         k = self.key(x) #(B, T, C)
         q = self.query(x) #(B, T, C)
-        wei = q @ k.transpose(-2, -1) * C **-0.5
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
         v = self.value(x) #(B, T, C)
-        out = wei @ v #(B,T,T) @ ( B, T, C) -> (B, T, C)
+
+        # wei = q @ k.transpose(-2, -1) * C **-0.5
+        # wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        # wei = F.softmax(wei, dim=-1) # (B, T, T)
+        # wei = self.dropout(wei)
+        # out = wei @ v #(B,T,T) @ ( B, T, C) -> (B, T, C)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         return out
 
 
@@ -191,7 +244,7 @@ class BigramLanguageModel(nn.Module):
     self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
     self.ln_f = nn.LayerNorm(n_embd)
     self.lm_head = nn.Linear(n_embd, vocab_size)
-    # self.feed_forward = nn.Linear()
+    self.token_embedding_table.weight = self.lm_head.weight
 
   def forward(self, idx, targets=None):
     B, T = idx.shape
@@ -231,18 +284,13 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel(vocab_size)
 m = model.to(device)
+model = torch.compile(model)
 
 first_param = next(model.parameters())
 print('model device',first_param.device)
 
 first_param = next(m.parameters())
 print('m device',first_param.device)
-
-# first_param = next(model.parameters())
-# logits, loss  = model(xb, yb)
-# print(logits.shape)
-# print(loss)
-
 
 
 
@@ -253,15 +301,28 @@ start_time = time.time()
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 for step in range(max_iters):
+    t0 = time.time()
+    # xb, yb = get_batch('train')
+    xb, yb = data_loader.next_batch()
+    B, T = xb.shape
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(xb, yb)
+    loss.backward()
+    optimizer.step()
+    torch.cuda.synchronize
+
+    t1 = time.time()
     if step % eval_interval == 0 :
         losses = estimate_loss()
         print(f"step {iter}: train loss{losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-    xb, yb = get_batch('train')
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+        dt = (t1 - t0) * 1000 # milli sec
+        token_per_sec = (B * T)/ (t1-t0)
+        print(f'step {step}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {token_per_sec:.2f}')
+
+
 
 
 

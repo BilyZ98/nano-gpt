@@ -1,11 +1,14 @@
 
 import os
 
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.distributed import init_process_group
-torch.manual_seed(1337)
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
 
 #!wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 dir = '/GPUFS/nsccgz_qylin_1/zt/persona_txt/'
@@ -33,6 +36,7 @@ torch.set_float32_matmul_precision('high')
 # DDP launch :
 # torchrun --standalone  -nproc_per_node=8 persona_gpt.py
 # 
+start_time = time.time()
 ddp = int(os.environ.get('RANK',-1)) != -1
 if ddp:
     assert torch.cuda.is_available(), " for now I think we need cuda for ddp"
@@ -57,7 +61,7 @@ else:
 
 batch_size = 64
 block_size = 256 # what is the maximum context length for predictions
-max_iters = 5000
+max_iters = 50
 eval_interval = 500
 learning_rate = 3e-4
 eval_iters = 200
@@ -66,10 +70,10 @@ n_head = 6
 n_layer = 6
 dropout = 0.2
 
-# print("I am gpu:", ddp_rank)
+print("I am gpu:", ddp_rank)
 # import sys; sys.exit(0)
 
-torch.manual_seed(1337)
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 
 chars = sorted(list(set(text)))
@@ -85,15 +89,17 @@ print(encode("hii there"))
 print(decode(encode("hii there")))
 
 data = torch.tensor(encode(text), dtype=torch.long)
-print(data.shape, data.dtype)
-print(data[:100])
+print('Load tokens:', data.shape, data.dtype)
 
 n = int(0.9*len(data))
 train_data = data[:n]
 val_data = data[n:]
 
-
 torch.manual_seed(1337)
+if device_type == "cuda":
+    torch.cuda.manual_seed(1337)
+
+
 
 def get_batch(split):
   data = train_data if split == 'train' else val_data
@@ -123,10 +129,10 @@ class DataLoader:
         self.current_idx += B * T * self.num_process
         if self.current_idx + B * T * self.num_process + 1> len(self.data):
             self.current_idx = self.B * self.T * self.process_rank
-        x, y = x.to(device), y.to(device)
         return x, y
 
-data_loader = DataLoader(train_data, batch_size, block_size )
+data_loader = DataLoader(train_data, batch_size, block_size, ddp_rank, ddp_world_size )
+eval_data_loader = DataLoader(val_data, batch_size, block_size, ddp_rank, ddp_world_size )
 
 xb, yb = data_loader.next_batch()
 print('xb shape:')
@@ -152,8 +158,6 @@ def estimate_loss():
     model.train()
     return out
 
-
-torch.manual_seed(1337)
 
 class Head(nn.Module):
     """One head of self-attention"""
@@ -257,16 +261,16 @@ class BigramLanguageModel(nn.Module):
     x = self.blocks(x)
     x = self.ln_f(x)
     logits = self.lm_head(x) # (B, T, vocab_size)
-
+        
 
     loss = None
     if targets is None:
-      loss = None
+        loss = None
     else:
-      B, T, C = logits.shape
-      logits = logits.view(B*T, C)
-      targets = targets.view(B*T) if targets is not None else None
-      loss = F.cross_entropy(logits, targets)
+        B, T, C = logits.shape
+        logits = logits.view(B*T, C)
+        targets = targets.view(B*T) if targets is not None else None
+        loss = F.cross_entropy(logits, targets)
 
     return logits, loss
 
@@ -281,10 +285,56 @@ class BigramLanguageModel(nn.Module):
       idx = torch.cat((idx, idx_next), dim=1) #(B, T+1)
     return idx
 
+def generate_tokens(model, idx, max_new_tokens, yb=None):
+    model.eval()
+    #with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    idx = idx.to(device)
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            print('idx length:', len(idx))
+            idx_cond = idx[:, -block_size:]
+            print('idx_cond length:', len(idx_cond))
+            idx_cond_device = idx_cond.device
+            print('idx_cond device', idx_cond_device)
+            B, T = idx_cond.shape
+            print('idx_cond shape:', B, T)
+            logits, loss = model(idx_cond, yb) # (B,T,vocab_size)
+            #print('shape of logits', logits.shape)
+            logits = logits[:, -1, :] # becomes (B, C)
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1) #(B,1)
+            idx = torch.cat((idx, idx_next), dim=1) #(B, T+1)
+    model.train()
+    return idx
+
+def call_generate_tokens(model):
+    idx = torch.zeros((1, 1), dtype=torch.long, device=device )
+    # cur_text = "hi"
+    # idx = torch.tensor(encode(cur_text), dtype=torch.long, device=device)
+    idx_device = idx.device
+    print('idx device:', idx_device)
+    # print(decode(model.generate(idx, max_new_tokens=500)[0].tolist()))
+    start_time = time.time()
+    generated_idx = generate_tokens(model, idx, 32 )[0].tolist()
+    end_time = time.time()
+    print('token generation time:', end_time-start_time)
+    start_time = time.time()
+    decode_txt = decode(generated_idx)
+    print(f"rank: {ddp_local_rank}, {decode_txt}")
+    end_time = time.time()
+    print('token decode time', end_time-start_time)
+
 
 model = BigramLanguageModel(vocab_size)
 m = model.to(device)
-model = torch.compile(model)
+use_compile = False
+if use_compile:
+    start_time = time.time()
+    model = torch.compile(model)
+    end_time = time.time()
+    print('compile time:', end_time-start_time)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 first_param = next(model.parameters())
 print('model device',first_param.device)
@@ -292,9 +342,9 @@ print('model device',first_param.device)
 first_param = next(m.parameters())
 print('m device',first_param.device)
 
+end_time = time.time()
+print('ini time:', end_time - start_time)
 
-
-import time
 
 # Start the timer
 start_time = time.time()
@@ -304,26 +354,37 @@ for step in range(max_iters):
     t0 = time.time()
     # xb, yb = get_batch('train')
     xb, yb = data_loader.next_batch()
+    xb, yb = xb.to(device), yb.to(device)
     B, T = xb.shape
+    model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(xb, yb)
+    # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    logits, loss = model(xb, yb)
+
+    # if ddp:
+    #     model.require_backward_grad_sync = True
     loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+        
     optimizer.step()
-    torch.cuda.synchronize
+    if device_type == "cuda":
+        torch.cuda.synchronize() # wait for the GPU to finish work
 
     t1 = time.time()
-    if step % eval_interval == 0 :
-        losses = estimate_loss()
-        print(f"step {iter}: train loss{losses['train']:.4f}, val loss {losses['val']:.4f}")
+    token_processed = B * T * ddp_world_size
+    #if step % eval_interval == 0 :
+    #    losses = estimate_loss()
+    #    print(f"step {iter}: train loss{losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        dt = (t1 - t0) * 1000 # milli sec
-        token_per_sec = (B * T)/ (t1-t0)
+    dt = (t1 - t0) * 1000 # milli sec
+    token_per_sec = token_processed/ (t1-t0)
+    if master_process:
+        call_generate_tokens(model)
         print(f'step {step}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {token_per_sec:.2f}')
-
-
-
+        
 
 
 # End the timer
@@ -332,18 +393,24 @@ end_time = time.time()
 
 # Calculate and print the time taken
 time_taken = end_time - start_time
-print(f'Time taken: {time_taken} seconds')
 
-def count_parameters(model):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total_params, trainable_params
+if master_process:
+    print(f'Time taken: {time_taken} seconds')
 
-# Assuming 'model' is your PyTorch model
-total_params, trainable_params = count_parameters(model)
-print(f"Total parameters: {total_params}")
-print(f"Trainable parameters: {trainable_params}")
+    def count_parameters(model):
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        return total_params, trainable_params
+
+    # Assuming 'model' is your PyTorch model
+    total_params, trainable_params = count_parameters(model)
+    print(f"Total parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params}")
 
 
-idx = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(model.generate(idx, max_new_tokens=500)[0].tolist()))
+    
+
+if ddp:
+    destroy_process_group()
+
+
